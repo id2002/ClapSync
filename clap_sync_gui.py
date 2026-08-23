@@ -134,23 +134,182 @@ def find_video_peaks(video_path, start=None, end=None, min_gap_s=0.25, crop=None
 
 
 def match_peaks(a_times, b_times, tolerance=0.75):
-    candidates = []
-    for ai, a in enumerate(a_times):
-        for bi, b in enumerate(b_times):
-            d = abs(b - a)
-            if d <= tolerance:
-                candidates.append((d, ai, bi))
-    candidates.sort(key=lambda c: c[0])
+    """Empareja a_times (ej. audio) con b_times (ej. video) EN ORDEN CRONOLÓGICO.
 
-    used_a, used_b, pairs = set(), set(), []
-    for d, ai, bi in candidates:
-        if ai in used_a or bi in used_b:
-            continue
-        pairs.append((a_times[ai], b_times[bi]))
-        used_a.add(ai)
-        used_b.add(bi)
-    pairs.sort(key=lambda p: p[0])
+    A propósito NO usa 'la pareja más cercana de todas las combinaciones posibles':
+    ese enfoque puede dejar que un ruido lejano en el tiempo, que por casualidad cae
+    con una distancia menor, le "robe" la pareja al aplauso real (normalmente el
+    primero). En su lugar, procesa cada evento de a_times en orden y le busca la
+    mejor pareja disponible en b_times SIN retroceder — así el primer evento real
+    siempre tiene prioridad para encontrar su pareja correcta.
+    """
+    pairs = []
+    start_j = 0
+    for a in a_times:
+        best_j, best_d = None, None
+        for j in range(start_j, len(b_times)):
+            d = b_times[j] - a
+            if d > tolerance:
+                break  # b_times está ordenado; más adelante solo se aleja más
+            if d < -tolerance:
+                continue  # todavía no llegamos a la zona de tolerancia
+            ad = abs(d)
+            if best_d is None or ad < best_d:
+                best_d, best_j = ad, j
+        if best_j is not None:
+            pairs.append((a, b_times[best_j]))
+            start_j = best_j + 1
     return pairs
+
+
+def compute_audio_envelope(wav_path, window_s=0.01):
+    from scipy.io import wavfile
+
+    sr, data = wavfile.read(wav_path)
+    data = data.astype(np.float64)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+
+    window = max(1, int(sr * window_s))
+    n = len(data) // window
+    if n < 2:
+        return np.array([]), np.array([])
+    env = np.array([np.sqrt(np.mean(data[i * window:(i + 1) * window] ** 2)) for i in range(n)])
+    times = np.arange(n) * window / sr
+    return times, env
+
+
+def compute_video_envelope(video_path, start=None, end=None, crop=None):
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"No pude abrir el video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if crop is not None:
+        x0, y0, x1, y1 = crop
+        px0, py0, px1, py1 = int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height)
+    else:
+        px0, py0, px1, py1 = 0, 0, width, height
+
+    if start:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+
+    prev_gray = None
+    diffs = []
+    frame_index = 0
+    start_frame_time = start or 0
+
+    while True:
+        if end is not None and (start_frame_time + frame_index / fps) > end:
+            break
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = frame[py0:py1, px0:px1]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (160, 90))
+        if prev_gray is not None:
+            diffs.append(np.sum(np.abs(gray.astype(np.int32) - prev_gray.astype(np.int32))))
+        prev_gray = gray
+        frame_index += 1
+
+    cap.release()
+    times = start_frame_time + (np.arange(1, len(diffs) + 1) / fps)
+    return times, np.array(diffs, dtype=np.float64), fps
+
+
+def cross_correlate_offset(audio_times, audio_env, video_times, video_env, max_lag_s=0.3, step_s=0.01):
+    """max_lag_s: qué tan lejos busca el desfase, en segundos hacia cada lado.
+    OJO: entre más grande, más riesgo de "engancharse" con un patrón repetitivo
+    (música, canto, un gesto que se repite) que por casualidad correlaciona fuerte
+    en un punto lejano y equivocado. Mantenlo lo más chico posible dado lo que ya
+    sabes de tu propio desfase típico — no hace falta buscar más lejos de lo real."""
+    """Encuentra el desfase (video_t - audio_t) que mejor alinea los DOS patrones completos
+    de actividad, no un solo pico. Más resistente al ruido que el método de aplausos."""
+    if len(audio_times) < 2 or len(video_times) < 2:
+        raise ValueError("No hay suficiente señal de audio o video en la ventana para correlacionar.")
+
+    grid_start = max(audio_times[0], video_times[0])
+    grid_end = min(audio_times[-1], video_times[-1])
+    if grid_end - grid_start < 0.5:
+        raise ValueError("La ventana es muy corta para este método. Usa al menos 2-3 segundos.")
+
+    grid = np.arange(grid_start, grid_end, step_s)
+    a_interp = np.interp(grid, audio_times, audio_env)
+    v_interp = np.interp(grid, video_times, video_env)
+
+    a_norm = (a_interp - a_interp.mean()) / (a_interp.std() + 1e-9)
+    v_norm = (v_interp - v_interp.mean()) / (v_interp.std() + 1e-9)
+
+    max_shift = max(1, int(max_lag_s / step_s))
+    n_total = len(grid)
+    scored = []
+    for s in range(-max_shift, max_shift + 1):
+        if s >= 0:
+            a_seg = a_norm[: n_total - s]
+            v_seg = v_norm[s:]
+        else:
+            a_seg = a_norm[-s:]
+            v_seg = v_norm[: n_total + s]
+        n = min(len(a_seg), len(v_seg))
+        if n < 20:
+            continue
+        score = float(np.dot(a_seg[:n], v_seg[:n]) / n)
+        scored.append((s, score))
+
+    if not scored:
+        raise ValueError("La ventana es muy corta para calcular la correlación con confianza.")
+
+    best_shift, best_score = max(scored, key=lambda x: x[1])
+    scores_arr = np.array([sc for _, sc in scored])
+    confidence = (best_score - scores_arr.mean()) / (scores_arr.std() + 1e-9)
+    offset_s = best_shift * step_s
+    return offset_s, best_score, confidence
+
+
+def analyze_correlation(video_path, start=None, end=None, crop=None, max_lag_ms=300, log=print):
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"No encuentro el archivo: {video_path}")
+    if not check_ffmpeg():
+        raise EnvironmentError("No encontré ffmpeg. Instálalo y agrégalo al PATH del sistema.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = os.path.join(tmp, "audio.wav")
+        log("Extrayendo audio...")
+        extract_audio(video_path, wav_path, start, end)
+
+        log("Calculando patrón de energía del audio...")
+        raw_audio_times, audio_env = compute_audio_envelope(wav_path)
+        audio_times = raw_audio_times + (start or 0)
+
+        log("Calculando patrón de movimiento del video...")
+        video_times, video_env, fps = compute_video_envelope(video_path, start, end, crop=crop)
+
+    log(f"Buscando el desfase (dentro de ±{max_lag_ms:.0f} ms) que mejor alinea ambos patrones...")
+    offset_s, score, confidence = cross_correlate_offset(
+        audio_times, audio_env, video_times, video_env, max_lag_s=max_lag_ms / 1000
+    )
+
+    return {"offset_ms": offset_s * 1000, "offset_frames": offset_s * fps, "score": score, "confidence": confidence}
+
+
+def format_confidence(confidence):
+    base = (
+        "Nota: esta confianza mide qué tan definido es el pico encontrado DENTRO del rango de "
+        "búsqueda, no si el número en sí es realista. Si el resultado no tiene sentido comparado "
+        "con lo que ya sabes de tu equipo, desconfía igual y prueba acotando el rango (± ms).\n\n"
+    )
+    if confidence > 4:
+        return base + "Alta — el patrón coincide claramente en ese desfase, dentro del rango buscado."
+    if confidence > 2:
+        return base + "Media — coincide, pero no de forma aplastante. Cruza este resultado con otra prueba si puedes."
+    return base + ("Baja — la ventana probablemente no tiene suficiente actividad para confiar en este número. "
+                    "Prueba con una ventana más larga o con más movimiento/habla.")
 
 
 def analyze(video_path, start=None, end=None, crop=None, sensitivity=3.0, log=print):
@@ -256,7 +415,7 @@ def launch_gui():
 
     root = tk.Tk()
     root.title("Clap Sync — Detector de desfase audio/video")
-    root.geometry("640x600")
+    root.geometry("660x690")
     root.resizable(False, False)
 
     video_path_var = tk.StringVar()
@@ -300,6 +459,14 @@ def launch_gui():
         frame_top, from_=1.0, to=6.0, resolution=0.5, orient="horizontal",
         variable=sensitivity_var, length=250,
     ).grid(row=6, column=0, columnspan=2, sticky="w")
+
+    max_lag_var = tk.StringVar(value="300")
+    tk.Label(
+        frame_top,
+        text="Solo para 'Analizar (correlación)': rango de búsqueda ± ms (déjalo chico, evita enganchar música/ritmo):",
+        wraplength=560, justify="left",
+    ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+    tk.Entry(frame_top, textvariable=max_lag_var, width=10).grid(row=8, column=0, sticky="w")
 
     # Lista de aplausos detectados
     list_frame = tk.Frame(root, padx=15)
@@ -402,17 +569,56 @@ def launch_gui():
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def run_correlation():
+        video_path = video_path_var.get().strip()
+        if not video_path:
+            messagebox.showwarning("Falta el video", "Primero elige un archivo de video.")
+            return
+        start, end = get_start_end()
+        crop = parse_crop(crop_var.get())
+        try:
+            max_lag_ms = float(max_lag_var.get())
+        except ValueError:
+            messagebox.showwarning("Rango inválido", "El rango de búsqueda (± ms) debe ser un número.")
+            return
+
+        output.configure(state="normal")
+        output.delete("1.0", "end")
+        output.configure(state="disabled")
+        listbox.delete(0, "end")
+        correlation_btn.configure(state="disabled", text="Correlacionando...")
+
+        def worker():
+            try:
+                r = analyze_correlation(video_path, start, end, crop=crop, max_lag_ms=max_lag_ms, log=log)
+                log("\n--- RESULTADO (método de correlación) ---")
+                log(f"Confianza: {format_confidence(r['confidence'])}")
+                log("")
+                log(format_offset_instructions({"offset_ms": r["offset_ms"], "offset_frames": r["offset_frames"]}))
+            except Exception as e:
+                log(f"\nERROR: {e}")
+            finally:
+                correlation_btn.configure(state="normal", text="Analizar (correlación, más robusto)")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=5)
 
-    analyze_btn = tk.Button(btn_frame, text="Analizar", command=run_analysis, bg="#4a90d9", fg="white", padx=10, pady=5)
+    analyze_btn = tk.Button(btn_frame, text="Analizar (aplausos)", command=run_analysis, bg="#4a90d9", fg="white", padx=10, pady=5)
     analyze_btn.grid(row=0, column=0, padx=5)
+
+    correlation_btn = tk.Button(
+        btn_frame, text="Analizar (correlación, más robusto)", command=run_correlation,
+        bg="#2e7d32", fg="white", padx=10, pady=5,
+    )
+    correlation_btn.grid(row=0, column=1, padx=5)
 
     diagnose_btn = tk.Button(
         btn_frame, text="Diagnosticar cámaras (izq. vs der.)", command=run_diagnose,
         bg="#888888", fg="white", padx=10, pady=5,
     )
-    diagnose_btn.grid(row=0, column=1, padx=5)
+    diagnose_btn.grid(row=1, column=0, columnspan=2, pady=(5, 0))
 
     root.mainloop()
 
@@ -429,6 +635,10 @@ def run_cli():
     parser.add_argument("--clap", type=int, default=1, help="Qué aplauso usar en orden cronológico (1 = primero)")
     parser.add_argument("--crop", type=str, default=None, help="'left', 'right', o 'x0,y0,x1,y1'")
     parser.add_argument("--diagnose", action="store_true", help="Compara cámara izquierda vs derecha")
+    parser.add_argument("--correlation", action="store_true",
+                         help="Usa el método de correlación (más robusto al ruido) en vez de detectar aplausos puntuales")
+    parser.add_argument("--max-lag", type=float, default=300,
+                         help="Solo con --correlation: rango de búsqueda en ± ms (default 300). Más chico = menos riesgo de engancharse con música/ritmo.")
     parser.add_argument("--sensitivity", type=float, default=3.0,
                          help="Desviaciones estándar para considerar un golpe (default 3.0). Baja = detecta más ruido, alta = más estricto.")
     args = parser.parse_args()
@@ -443,6 +653,13 @@ def run_cli():
             for i, r in enumerate(results, start=1):
                 print(f"{i}. izquierda={r['left_time']:.3f}s  derecha={r['right_time']:.3f}s  offset={r['offset_ms']:+.1f} ms")
             print("\nEste desfase ya está fijo en el video. Úsalo para OBS -> Video Delay (Async).")
+            return
+
+        if args.correlation:
+            r = analyze_correlation(args.video, args.start, args.end, crop=crop, max_lag_ms=args.max_lag)
+            print("\n--- RESULTADO (método de correlación) ---")
+            print(f"Confianza: {format_confidence(r['confidence'])}\n")
+            print(format_offset_instructions({"offset_ms": r["offset_ms"], "offset_frames": r["offset_frames"]}))
             return
 
         results = analyze(args.video, args.start, args.end, crop=crop, sensitivity=args.sensitivity)

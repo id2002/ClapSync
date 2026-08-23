@@ -1,6 +1,6 @@
 clap_sync.py — Detecta automáticamente el desfase de audio/video usando un aplauso (clap)
 como referencia, y te dice cuánto y en qué dirección mover el audio en OBS o DaVinci Resolve.
-
+ **** OJO - Todvia esta en desarrollo ****
 CÓMO FUNCIONA
 -------------
 1. Extrae el audio del video con ffmpeg.

@@ -69,7 +69,45 @@ def find_audio_peaks(wav_path, min_gap_s=0.25, sensitivity=3.0):
     threshold = np.mean(rise) + sensitivity * np.std(rise)
     distance = max(1, int(min_gap_s * sr / window))
     peak_indices, _ = find_peaks(rise, height=threshold, distance=distance)
-    return sorted((idx + 1) * window / sr for idx in peak_indices)
+    coarse_times = sorted((idx + 1) * window / sr for idx in peak_indices)
+
+    # Segundo pase: cada golpe se detectó con bloques de 10ms (grueso). Ahora que
+    # sabemos aproximadamente dónde está cada uno, lo re-analizamos con bloques de
+    # 1ms SOLO en una ventanita alrededor, para ubicar el inicio real del golpe
+    # con mucha más precisión, en vez de quedarnos con la resolución de 10ms.
+    return [refine_audio_onset(data, sr, t) for t in coarse_times]
+
+
+def refine_audio_onset(data, sr, coarse_time_s, search_radius_s=0.15, fine_window_s=0.001):
+    """Ubica el inicio real de un golpe de audio con precisión fina (~1ms), a partir
+    de una estimación gruesa. Busca dónde la energía empieza a subir bruscamente
+    cerca del pico, en vez de solo tomar el bloque de 10ms donde cayó el pico."""
+    center = int(coarse_time_s * sr)
+    radius = int(search_radius_s * sr)
+    lo, hi = max(0, center - radius), min(len(data), center + radius)
+    segment = data[lo:hi]
+
+    fine_window = max(1, int(sr * fine_window_s))
+    n = len(segment) // fine_window
+    if n < 3:
+        return coarse_time_s  # ventana muy corta para refinar, nos quedamos con la gruesa
+
+    env = np.array([
+        np.sqrt(np.mean(segment[i * fine_window:(i + 1) * fine_window] ** 2))
+        for i in range(n)
+    ])
+    peak_idx = int(np.argmax(env))
+    peak_val = env[peak_idx]
+    baseline = np.median(env[:max(1, peak_idx)]) if peak_idx > 0 else env[0]
+    threshold = baseline + 0.2 * (peak_val - baseline)
+
+    onset_idx = 0
+    for i in range(peak_idx, -1, -1):
+        if env[i] < threshold:
+            onset_idx = i + 1
+            break
+
+    return (lo + onset_idx * fine_window) / sr
 
 
 def parse_crop(label):

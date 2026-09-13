@@ -57,7 +57,7 @@ def _robust_threshold(values, sensitivity):
     return median + sensitivity * max(1.4826 * mad, 1e-9)
 
 
-def find_audio_peaks(wav_path, min_gap_s=0.25, sensitivity=3.0):
+def find_audio_peaks(wav_path, min_gap_s=0.25, sensitivity=3.0, return_strengths=False):
     """sensitivity: cuántas desviaciones estándar debe sobresalir un golpe para contar.
     Más BAJO (ej. 1.5) = detecta más golpes, incluye más ruido de fondo.
     Más ALTO (ej. 5.0) = solo golpes muy claros, ignora ruido, pero puede perderse
@@ -90,17 +90,43 @@ def find_audio_peaks(wav_path, min_gap_s=0.25, sensitivity=3.0):
     if len(rise) == 0:
         return []
 
+    median_rise = float(np.median(rise))
+    spread_rise = max(1.4826 * float(np.median(np.abs(rise - median_rise))), 1e-9)
     threshold = _robust_threshold(rise, sensitivity)
     distance = max(1, int(min_gap_s * sr / window))
     prominence = max(1e-9, threshold - float(np.median(rise)))
-    peak_indices, _ = find_peaks(rise, height=threshold, prominence=prominence, distance=distance)
-    coarse_times = sorted((idx + 1) * window / sr for idx in peak_indices)
+    primary_indices, _ = find_peaks(rise, height=threshold, prominence=prominence, distance=distance)
+
+    # Un aplauso que se oye más bajo no debe perderse por completo. Buscamos
+    # candidatos secundarios con un umbral menor, pero los marcamos con su
+    # fuerza para que el consenso no les dé el mismo peso que a un golpe claro.
+    recovery_sensitivity = max(1.0, sensitivity * 0.65)
+    recovery_threshold = _robust_threshold(rise, recovery_sensitivity)
+    recovery_indices, _ = find_peaks(
+        rise,
+        height=recovery_threshold,
+        prominence=max(spread_rise * 0.75, recovery_threshold - median_rise),
+        distance=distance,
+    )
+
+    # Unimos ambos pases y mantenemos un único pico por separación mínima.
+    candidates = sorted(set(primary_indices).union(recovery_indices), key=lambda i: rise[i], reverse=True)
+    selected = []
+    for idx in candidates:
+        if all(abs(idx - kept) >= distance for kept in selected):
+            selected.append(int(idx))
+    peak_indices = np.array(sorted(selected), dtype=int)
+    coarse_times = [(idx + 1) * window / sr for idx in peak_indices]
 
     # Segundo pase: cada golpe se detectó con bloques de 10ms (grueso). Ahora que
     # sabemos aproximadamente dónde está cada uno, lo re-analizamos con bloques de
     # 1ms SOLO en una ventanita alrededor, para ubicar el inicio real del golpe
     # con mucha más precisión, en vez de quedarnos con la resolución de 10ms.
-    return [refine_audio_onset(filtered, sr, t) for t in coarse_times]
+    times = [refine_audio_onset(filtered, sr, t) for t in coarse_times]
+    if return_strengths:
+        strengths = [max(0.0, (rise[idx] - median_rise) / spread_rise) for idx in peak_indices]
+        return times, strengths
+    return times
 
 
 def refine_audio_onset(data, sr, coarse_time_s, search_radius_s=0.15, fine_window_s=0.001):
@@ -152,7 +178,10 @@ def parse_crop(label):
     return None
 
 
-def find_video_peaks(video_path, start=None, end=None, min_gap_s=0.25, crop=None, sensitivity=3.0, relaxed=False):
+def find_video_peaks(
+    video_path, start=None, end=None, min_gap_s=0.25, crop=None,
+    sensitivity=3.0, relaxed=False, return_strengths=False,
+):
     import cv2
     from scipy.signal import find_peaks
 
@@ -194,7 +223,7 @@ def find_video_peaks(video_path, start=None, end=None, min_gap_s=0.25, crop=None
 
     cap.release()
     if not diffs:
-        return [], fps
+        return ([], fps, []) if return_strengths else ([], fps)
 
     diffs = np.array(diffs, dtype=np.float64)
     # Solo el modo de aplausos usa un umbral más permisivo. El diagnóstico de
@@ -206,10 +235,18 @@ def find_video_peaks(video_path, start=None, end=None, min_gap_s=0.25, crop=None
     prominence = max(1e-9, threshold - float(np.median(diffs)))
     peak_indices, _ = find_peaks(diffs, height=threshold, prominence=prominence, distance=distance)
     times = sorted(start_frame_time + (idx + 1) / fps for idx in peak_indices)
+    if return_strengths:
+        median_diff = float(np.median(diffs))
+        spread_diff = max(1.4826 * float(np.median(np.abs(diffs - median_diff))), 1e-9)
+        strengths = [max(0.0, (diffs[idx] - median_diff) / spread_diff) for idx in peak_indices]
+        return times, fps, strengths
     return times, fps
 
 
-def match_peaks(a_times, b_times, tolerance=0.75, consensus_tolerance=0.08):
+def match_peaks(
+    a_times, b_times, tolerance=0.75, consensus_tolerance=0.08,
+    a_strengths=None, b_strengths=None,
+):
     """Empareja a_times (ej. audio) con b_times (ej. video) EN ORDEN CRONOLÓGICO.
 
     A propósito NO usa 'la pareja más cercana de todas las combinaciones posibles':
@@ -222,7 +259,16 @@ def match_peaks(a_times, b_times, tolerance=0.75, consensus_tolerance=0.08):
     # Primero se busca el desfase que se repite. El método anterior elegía el
     # movimiento visual más cercano para cada golpe, aunque fuese una persona
     # moviéndose y no el aplauso. Un desfase A/V real permanece constante.
-    candidates = [(b - a, a, b) for a in a_times for b in b_times if abs(b - a) <= tolerance]
+    if a_strengths is None:
+        a_strengths = [1.0] * len(a_times)
+    if b_strengths is None:
+        b_strengths = [1.0] * len(b_times)
+    candidates = [
+        (b - a, i, j, max(0.1, float(a_strengths[i])) * max(0.1, float(b_strengths[j])))
+        for i, a in enumerate(a_times)
+        for j, b in enumerate(b_times)
+        if abs(b - a) <= tolerance
+    ]
     if not candidates:
         return []
 
@@ -230,24 +276,30 @@ def match_peaks(a_times, b_times, tolerance=0.75, consensus_tolerance=0.08):
     # Histograma desplazado: evita que el origen de los bins decida un empate.
     bin_width = max(0.02, consensus_tolerance)
     bins = np.round(offsets / bin_width).astype(int)
-    unique, counts = np.unique(bins, return_counts=True)
-    dominant_bin = unique[np.argmax(counts)]
+    unique = np.unique(bins)
+    # La cantidad de eventos manda; la energía sólo desempata dos secuencias
+    # con el mismo número de coincidencias.
+    bin_scores = [
+        (int(np.sum(bins == value)), sum(c[3] for c, b in zip(candidates, bins) if b == value))
+        for value in unique
+    ]
+    dominant_bin = unique[max(range(len(unique)), key=lambda k: bin_scores[k])]
     in_bin = offsets[np.abs(offsets - dominant_bin * bin_width) <= bin_width]
     center = float(np.median(in_bin))
 
     pairs, used_video = [], set()
-    for a in a_times:
-        choices = [(abs((b - a) - center), j, b) for j, b in enumerate(b_times)
+    for i, a in enumerate(a_times):
+        choices = [(abs((b - a) - center), -float(b_strengths[j]), j, b) for j, b in enumerate(b_times)
                    if j not in used_video and abs((b - a) - center) <= consensus_tolerance]
         if choices:
-            _, j, b = min(choices)
+            _, _, j, b = min(choices)
             pairs.append((a, b))
             used_video.add(j)
 
     # Con un único aplauso no existe consenso: conservamos la pareja más cercana.
     if not pairs:
-        _, a, b = min(candidates, key=lambda c: abs(c[0] - center))
-        return [(a, b)]
+        _, i, j, _ = min(candidates, key=lambda c: abs(c[0] - center))
+        return [(a_times[i], b_times[j])]
     return pairs
 
 
@@ -383,17 +435,23 @@ def analyze_correlation(video_path, start=None, end=None, crop=None, max_lag_ms=
         # Si existen aplausos claros, dan una referencia temporal mucho más
         # fiable que correlacionar voz/música con el movimiento de todo el
         # cuadro. La correlación se limita alrededor de ese consenso.
-        raw_audio_peaks = find_audio_peaks(wav_path, sensitivity=sensitivity)
+        raw_audio_peaks, audio_strengths = find_audio_peaks(
+            wav_path, sensitivity=sensitivity, return_strengths=True,
+        )
         audio_peaks = [t + (start or 0) for t in raw_audio_peaks]
 
         log("Calculando patrón de movimiento del video...")
         video_times, video_env, fps = compute_video_envelope(video_path, start, end, crop=crop)
 
-        video_peaks, _ = find_video_peaks(
+        video_peaks, _, video_strengths = find_video_peaks(
             video_path, start, end, crop=crop, sensitivity=sensitivity, relaxed=True,
+            return_strengths=True,
         )
 
-    pairs = match_peaks(audio_peaks, video_peaks, tolerance=min(max_lag_ms, 750) / 1000)
+    pairs = match_peaks(
+        audio_peaks, video_peaks, tolerance=min(max_lag_ms, 750) / 1000,
+        a_strengths=audio_strengths, b_strengths=video_strengths,
+    )
     if pairs:
         pair_offsets = np.array([video_t - audio_t for audio_t, video_t in pairs])
         prior_offset_s = float(np.median(pair_offsets))
@@ -468,7 +526,9 @@ def analyze(video_path, start=None, end=None, crop=None, sensitivity=3.0, max_of
         extract_audio(video_path, wav_path, start, end)
 
         log("Buscando golpes/aplausos en el audio...")
-        raw_audio_peaks = find_audio_peaks(wav_path, sensitivity=sensitivity)
+        raw_audio_peaks, audio_strengths = find_audio_peaks(
+            wav_path, sensitivity=sensitivity, return_strengths=True,
+        )
         # OJO: extract_audio recorta el audio desde "start" en adelante, así que los
         # tiempos que devuelve find_audio_peaks son relativos a ESE recorte (empiezan en 0),
         # no al video completo. Hay que sumarle "start" para volverlos a tiempo absoluto,
@@ -476,8 +536,9 @@ def analyze(video_path, start=None, end=None, crop=None, sensitivity=3.0, max_of
         audio_peaks = [t + (start or 0) for t in raw_audio_peaks]
 
         log("Buscando golpes/movimientos en el video...")
-        video_peaks, fps = find_video_peaks(
+        video_peaks, fps, video_strengths = find_video_peaks(
             video_path, start, end, crop=crop, sensitivity=sensitivity, relaxed=True,
+            return_strengths=True,
         )
 
     if not audio_peaks or not video_peaks:
@@ -486,7 +547,10 @@ def analyze(video_path, start=None, end=None, crop=None, sensitivity=3.0, max_of
             "o cambia el recorte de cámara."
         )
 
-    pairs = match_peaks(audio_peaks, video_peaks, tolerance=max_offset_ms / 1000)
+    pairs = match_peaks(
+        audio_peaks, video_peaks, tolerance=max_offset_ms / 1000,
+        a_strengths=audio_strengths, b_strengths=video_strengths,
+    )
     if not pairs:
         audio_list = ", ".join(f"{t:.3f}s" for t in audio_peaks)
         video_list = ", ".join(f"{t:.3f}s" for t in video_peaks)

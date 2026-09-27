@@ -601,18 +601,21 @@ def diagnose_cameras(video_path, start=None, end=None, sensitivity=3.0, log=prin
 
 
 def format_offset_instructions(r):
+    # offset = instante_video - instante_audio.
+    # Positivo: el evento visual llega después, así que el AUDIO está adelantado.
+    # Negativo: el evento audible llega después, así que el AUDIO está atrasado.
     offset_ms, offset_frames = r["offset_ms"], r["offset_frames"]
     if abs(offset_ms) < 1:
         return "Prácticamente están sincronizados, no hace falta ajustar nada."
     if offset_ms > 0:
         return (
-            f"El video va {offset_ms:.1f} ms POR DELANTE del audio.\n"
+            f"El audio va {offset_ms:.1f} ms POR DELANTE del video.\n"
             f"  OBS: Sync Offset de esa pista = {int(offset_ms)} ms (positivo).\n"
             f"  DaVinci Resolve: mueve el clip de AUDIO {offset_frames:.2f} frames a la derecha "
             f"(o el de VIDEO esa misma cantidad a la izquierda)."
         )
     return (
-        f"El audio va {abs(offset_ms):.1f} ms POR DELANTE del video.\n"
+        f"El audio va {abs(offset_ms):.1f} ms ATRASADO respecto al video.\n"
         f"  OBS: Sync Offset de esa pista = {int(offset_ms)} ms (negativo).\n"
         f"  DaVinci Resolve: mueve el clip de AUDIO {abs(offset_frames):.2f} frames a la izquierda "
         f"(o el de VIDEO esa misma cantidad a la derecha)."
